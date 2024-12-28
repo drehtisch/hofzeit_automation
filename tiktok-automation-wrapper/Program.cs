@@ -1,24 +1,29 @@
-﻿using System.Diagnostics;
+﻿using System.Net.Http.Headers;
 using System.Reactive.Linq;
 using System.Text;
+using System.Text.Json;
 using CliWrap;
 using CliWrap.EventStream;
 
 namespace tiktok_automation_wrapper;
 
+// ReSharper disable once ClassNeverInstantiated.Global
 class Program
 {
-    static CancellationTokenSource cts = new CancellationTokenSource();
-    static CancellationTokenSource streamLinkCts = new CancellationTokenSource();
+    private static readonly CancellationTokenSource LiveCheckCts = new();
+    private static CancellationTokenSource _streamLinkCts = new();
 
-    private static string User = "";
+    private static string _user = "";
+    private const string StreamerBotUrl = "http://localhost:7474";
+    private const string BotToken = "";
+    
+    private static bool IsLive = false;
     static async Task Main(string[] args)
     {
-        var errorCounter = 0;
-        User = args.Length > 0 ? args[0] : "hofzeitprojekt";
-        Console.WriteLine($"Running tiktok automation wrapper! For user: {User}");
-        Console.CancelKeyPress += (s, ea) => cts.Cancel();
-        while (!cts.IsCancellationRequested)
+        _user = args.Length > 0 ? args[0] : "hofzeitprojekt";
+        Console.WriteLine($"Running tiktok automation wrapper! For user: {_user}");
+        Console.CancelKeyPress += ConsoleOnCancelKeyPress;
+        while (!LiveCheckCts.IsCancellationRequested)
         {
             try
             {
@@ -27,30 +32,33 @@ class Program
                         $"-c {(Environment.OSVersion.Platform == PlatformID.Win32NT ?
                             "conda activate tiktoklive" :
                             "\"source ~/anaconda3/bin/activate tiktoklive")} " +
-                        $"&& python -u check_live.py -n {User}");
-                await ListenToProcess(cmd, "check_live.py", cts.Token);
-                await Task.Delay(TimeSpan.FromSeconds(30));
+                        $"&& python -u live_notify.py -n {_user}");
+                await ListenToProcess(cmd, "live_notify.py", cancellationToken: LiveCheckCts.Token);
+                await Task.Delay(TimeSpan.FromSeconds(30), LiveCheckCts.Token);
             }
-            catch(Exception ex)
+            catch (TaskCanceledException)
             {
-                errorCounter++;
-                Console.WriteLine($"#{errorCounter} Error: " + ex);
-                if(errorCounter >= 50) throw;
+                Console.WriteLine("Live check task has been cancelled.");
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error running live check: {ex}");
+            }
+            
         }
     }
 
-    private static void HandleLine(string line, CancellationToken token)
+    private static async Task HandleLine(string line)
     {
         if (line.StartsWith('~'))
         {
             switch (line)
             {
                 case "~LIVE":
-                    HandleLive();
+                    await HandleLiveAsync();
                     break;
                 case "~LIVE_ENDED":
-                    HandleLiveEnd();
+                    await HandleLiveEndAsync();
                     break;
                 case "~DISCONNECTED":
                     Console.WriteLine("Disconnected");
@@ -59,90 +67,147 @@ class Program
                     Console.WriteLine("Running LiveCheck");
                     break;
                 default:
-                    Console.Error.WriteLine($"Unknown command: {line}");
+                    await Console.Error.WriteLineAsync($"Unknown command: {line}");
                     break;
             }
         }
     }
 
-    private static void HandleLiveEnd()
+    private static async Task HandleLiveEndAsync()
     {
+        if (!IsLive)
+        {
+            Console.WriteLine("Is not live anymore. Skipping...");
+            return;
+        }
+        IsLive = false;
         Console.WriteLine("LIVE ENDED");
-        streamLinkCts.Cancel();
+        await _streamLinkCts.CancelAsync();
+        await ExecuteStreamerBotActionAsync("LiveEnd", CancellationToken.None);
     }
 
-    private static void HandleLive()
+    private static async Task HandleLiveAsync()
     {
-        streamLinkCts = new CancellationTokenSource();
-        Console.WriteLine("LIVE DETECTED");
-        Task.Run(async () =>
+        if (IsLive)
         {
-            var errorCounter = 0;
-            while (!streamLinkCts.IsCancellationRequested)
+            Console.WriteLine("Is already live. Skipping...");
+            return;
+        }
+        await _streamLinkCts.CancelAsync();
+        _streamLinkCts = new CancellationTokenSource();
+        _streamLinkCts.Token.Register(() => Console.WriteLine("Quitting streamlink"));
+        Console.WriteLine("LIVE DETECTED");
+        _ = Task.Run(async () =>
+        {
+            try
             {
-                Console.WriteLine("Starting streamlink");
-                var cmd = Cli.Wrap("streamlink")
-                    .WithArguments($"https://www.tiktok.com/@{User}/live best --player-external-http --player-external-http-port 1312 -l all")
-                    .WithValidation(CommandResultValidation.None);
-                await ListenToProcess(cmd, "streamlink", streamLinkCts.Token);
-                Console.WriteLine($"#{errorCounter} streamlink crashed - waiting 30 seconds before retrying");
-                await Task.Delay(TimeSpan.FromSeconds(30));
-                errorCounter++;
-                if (errorCounter >= 5)
+                while (!_streamLinkCts.IsCancellationRequested)
                 {
-                    Console.WriteLine($"#{errorCounter} Error - Need fallback no stream found");
-                    break;
+                    Console.WriteLine("Starting streamlink");
+                    var cmd = Cli.Wrap("streamlink")
+                        .WithArguments(
+                            $"https://www.tiktok.com/@{_user}/live best --player-external-http --player-external-http-port 1312")
+                        .WithValidation(CommandResultValidation.None);
+                    await ListenToProcess(cmd, "streamlink", cancellationToken:_streamLinkCts.Token);
+                    Console.WriteLine("streamlink exited - waiting 10 seconds before retrying");
+                    await Task.Delay(TimeSpan.FromSeconds(10), _streamLinkCts.Token);
                 }
             }
-        });
-    }
-
-    private static async Task ListenToProcess(Command cmd, string name,
-        CancellationToken cancellationToken = default, int forceCancelAfterSeconds = 30)
-    {
-        using var forcefulCts = new CancellationTokenSource();
-        await using var link = cancellationToken.Register(() => { forcefulCts.CancelAfter(forceCancelAfterSeconds); });
-        await cmd.Observe().ForEachAsync((cmdEvent) =>
-        {
-            switch (cmdEvent)
+            catch (TaskCanceledException)
             {
-                case StartedCommandEvent started:
-                    Console.Out.WriteLine($"[{name}] Process started; ID: {started.ProcessId}");
-                    break;
-                case StandardOutputCommandEvent stdOut:
-                    if (!stdOut.Text.StartsWith('~'))
-                        Console.Out.WriteLine($"[{name}]Out> {stdOut.Text}");
-                    HandleLine(stdOut.Text, cancellationToken);
-                    break;
-                case StandardErrorCommandEvent stdErr:
-                    if (!stdErr.Text.StartsWith('~'))
-                        Console.Error.WriteLine($"[{name}]Err> {stdErr.Text}");
-                    HandleLine(stdErr.Text, cancellationToken);
-                    break;
-                case ExitedCommandEvent exited:
-                    Console.WriteLine($"[{name}] Process exited; Code: {exited.ExitCode}");
-                    break;
+                Console.WriteLine("Waiting for streamlink restart canceled");
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"[streamlink] Error handling live: {e}");
             }
         });
+        await ExecuteStreamerBotActionAsync("LiveStart", _streamLinkCts.Token);
+    }
+
+    private static async Task ExecuteStreamerBotActionAsync(string action, CancellationToken token)
+    {
+        try
+        {
+            Console.WriteLine($"Sending action '{action}' to StreamerBot");
+            using var client = new HttpClient();
+            client.BaseAddress = new Uri(StreamerBotUrl);
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", BotToken);
+            var payload = new
+            {
+                action = new
+                {
+                    name = action
+                }
+            };
+            var payLoadString = JsonSerializer.Serialize(payload);
+            var content = new StringContent(payLoadString, Encoding.Default, "application/json");
+            var response = await client.PostAsync("/DoAction", content, token);
+            var responseString = await response.Content.ReadAsStringAsync(token);
+            Console.WriteLine(
+                $"Streamer bot action send. Response: {response.StatusCode} {response.ReasonPhrase} -> {responseString}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Sending streamer bot action failed: {ex}");
+        }
+    }
+
+    private static async Task ListenToProcess(Command cmd, string name, int forceCancelAfterSeconds = 30,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var forcefulCts = new CancellationTokenSource();
+            await using var link = cancellationToken.Register(() =>
+            {
+                forcefulCts.CancelAfter(TimeSpan.FromSeconds(forceCancelAfterSeconds));
+            });
+            // any exception lambda is handled
+            await cmd.Observe(Encoding.Default, Encoding.Default, forcefulCts.Token, cancellationToken).ForEachAsync(
+                async void (cmdEvent) =>
+                {
+                    try
+                    {
+                        switch (cmdEvent)
+                        {
+                            case StartedCommandEvent started:
+                                await Console.Out.WriteLineAsync($"[{name}] Process started; ID: {started.ProcessId}");
+                                break;
+                            case StandardOutputCommandEvent stdOut:
+                                if (!stdOut.Text.StartsWith('~'))
+                                    await Console.Out.WriteLineAsync($"[{name}]Out> {stdOut.Text}");
+                                await HandleLine(stdOut.Text);
+                                break;
+                            case StandardErrorCommandEvent stdErr:
+                                if (!stdErr.Text.StartsWith('~'))
+                                    await Console.Error.WriteLineAsync($"[{name}]Err> {stdErr.Text}");
+                                await HandleLine(stdErr.Text);
+                                break;
+                            case ExitedCommandEvent exited:
+                                Console.WriteLine($"[{name}] Process exited; Code: {exited.ExitCode}");
+                                break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[{name}] Error handling command: {ex}");
+                    }
+                }, cancellationToken);
+        }
+        catch (TaskCanceledException)
+        {
+            Console.WriteLine($"[{name}] Process canceled");
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"[{name}] Error while listening to process: {e}");
+        }
     }
 
     private static void ConsoleOnCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
     {
-        cts.Cancel();
-    }
-
-    static void ProcessOnOutputDataReceived(DataReceivedEventArgs dataReceivedEventArgs)
-    {
-        var value = dataReceivedEventArgs.Data;
-        if (value is null) return;
-        if (value.StartsWith("frame"))
-        {
-            Console.SetCursorPosition(0, Console.CursorTop - 1);
-            Console.WriteLine(dataReceivedEventArgs.Data);
-        }
-        else
-        {
-            Console.WriteLine(dataReceivedEventArgs.Data);
-        }
+        LiveCheckCts.Cancel();
+        _streamLinkCts.Cancel();
     }
 }
