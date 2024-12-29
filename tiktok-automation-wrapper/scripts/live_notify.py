@@ -16,7 +16,10 @@ async def handle_liveend():
         if client.connected:
             await client.disconnect()
     except Exception as e:
-        print(f"An unexpected error handling LiveEnd occured: {e}")
+        if "WebSocket rejected by TikTok" in str(e):
+            print("WebSocket rejected due to detection. Suppressing error.")
+        else:
+            print(f"An unexpected error occurred during disconnect: {e}")
 
 async def on_connect(event: ConnectEvent):
     print(f"Connected to @{event.unique_id}!")
